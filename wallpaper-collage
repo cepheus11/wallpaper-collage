@@ -1,0 +1,225 @@
+#!/usr/bin/env python
+
+import os
+import random
+import re
+import fnmatch
+import time
+from pathlib import Path
+from PIL import Image, UnidentifiedImageError, ImageFile
+from time import sleep
+from common import jpeg_quality, debug_print, wallpaper_dir, collage_dir, interval, output_multiple,\
+    screen_width, screen_height, aspect_ratio, debug_print_image_info, auto_change
+from layoutOne import LayoutOne
+from twoTileLayout import TwoTileLayout
+from prSetName import pr_set_name
+import signal
+
+
+def filename_match(filename: str, regex_list: list) -> bool:
+    """
+    Check filename against multiple regexes.
+    :param filename: file part from os.walk() result
+    :param regex_list: list of compiled regexes. One regex for one file extension
+    :return: True if filename matches one of the regexes
+    """
+    for regex in regex_list:
+        if re.match(regex, filename):
+            return True
+    return False
+
+
+def list_of_images() -> list:
+    glob_expressions = ("*.jpg", "*.jpeg", "*.jpe", "*.jp2", "*.png", "*.bmp")
+    regex_list = [re.compile(fnmatch.translate(glob_expression), re.IGNORECASE) for glob_expression in glob_expressions]
+    result = []
+    for root, dirs, files in os.walk(wallpaper_dir, topdown=True):
+        result += [os.path.join(root, file) for file in files if filename_match(file, regex_list)]
+    return result
+
+
+def collect_images():
+    global image_files
+    start = time.time()
+    image_files = list_of_images()
+    end = time.time()
+    debug_print(f"Collected {len(image_files)} files in {end - start} seconds.")
+    if len(image_files) < 3:
+        print("Need at least 3 images")
+        exit(1)
+    else:
+        debug_print("")
+
+
+def sig_collect_images(signum, frame):
+    collect_images()
+    # remove no longer existing files from list of already chosen images:
+    for filename in chosen_image_files:
+        if not Path(filename).exists():
+            chosen_image_files.remove(filename)
+
+
+def create_layout_entry(name: str, layout_obj, dimensions: tuple) -> dict:
+    # calculate crop factor:
+    crop_f = layout_obj.crop_factor(dimensions)
+    debug_print(f"Layout {name}: {crop_f:.4f}")
+    # return dict {crop_factor: float, name: str, layout: obj}
+    return {
+        "crop_factor": crop_f,
+        "name": name,
+        "layout": layout_obj,
+    }
+
+
+def change_wallpaper():
+    global current_nr
+    global image_files
+    global chosen_image_files
+    debug_print(f"Collage {current_nr}")
+
+    # randomly select 3 images A, B, C which have not been selected before:
+    selected_files = []
+    selected_list = []
+    loaded = 0
+    while loaded < 3:
+        already_chosen = True
+        selected_file = None
+        while already_chosen:
+            selected_file = random.choice(image_files)
+            already_chosen = selected_file in chosen_image_files or selected_file in selected_files
+        if selected_file is not None:
+            selected_files.append(selected_file)
+            try:
+                image = Image.open(selected_file)
+                selected_list.append(image)
+                loaded += 1
+            except FileNotFoundError as ex:
+                debug_print(ex)
+            except UnidentifiedImageError as ex:
+                debug_print(ex)
+            except OSError as ex:
+                debug_print(ex)
+
+    # Calculate aspect ratios:
+    ar1 = aspect_ratio(selected_list[0])
+    debug_print_image_info("A", selected_files[0], ar1)
+    ar2 = aspect_ratio(selected_list[1])
+    debug_print_image_info("B", selected_files[1], ar2)
+    ar3 = aspect_ratio(selected_list[2])
+    debug_print_image_info("C", selected_files[2], ar3)
+
+    screen_dimensions = (screen_width, screen_height)
+
+    # Test the layouts:
+    # layouts is a list of dict {crop_factor: float, name: str, layout: obj}
+    layouts = []
+    # Layout One:
+    layout = LayoutOne(selected_list[0])
+    layouts.append(create_layout_entry("One", layout, screen_dimensions))
+
+    # Layout Two:
+    layout = TwoTileLayout(selected_list[0], selected_list[1], False)
+    layouts.append(create_layout_entry("Two", layout, screen_dimensions))
+
+    # Layout Three
+    inner_layout = TwoTileLayout(selected_list[0], selected_list[1], False)
+    layout = TwoTileLayout(inner_layout, selected_list[2], False)
+    layouts.append(create_layout_entry("Three", layout, screen_dimensions))
+
+    # Layout LargeLeft
+    inner_layout = TwoTileLayout(selected_list[1], selected_list[2], True)
+    layout = TwoTileLayout(selected_list[0], inner_layout, False)
+    layouts.append(create_layout_entry("LargeLeft", layout, screen_dimensions))
+
+    # Layout LargeRightCW
+    inner_layout = TwoTileLayout(selected_list[0], selected_list[2], True)
+    layout = TwoTileLayout(inner_layout, selected_list[1], False)
+    layouts.append(create_layout_entry("LargeRightCW", layout, screen_dimensions))
+
+    # Layout LargeRightCCW
+    inner_layout = TwoTileLayout(selected_list[0], selected_list[1], True)
+    layout = TwoTileLayout(inner_layout, selected_list[2], False)
+    layouts.append(create_layout_entry("LargeRightCCW", layout, screen_dimensions))
+
+    # Layout TwoVertical
+    layout = TwoTileLayout(selected_list[0], selected_list[1], True)
+    layouts.append(create_layout_entry("TwoVertical", layout, screen_dimensions))
+
+    # Layout Three Vertical
+    inner_layout = TwoTileLayout(selected_list[0], selected_list[1], True)
+    layout = TwoTileLayout(inner_layout, selected_list[2], True)
+    layouts.append(create_layout_entry("ThreeVertical", layout, screen_dimensions))
+
+    # Layout LargeBottom
+    inner_layout = TwoTileLayout(selected_list[0], selected_list[1], False)
+    layout = TwoTileLayout(inner_layout, selected_list[2], True)
+    layouts.append(create_layout_entry("LargeBottom", layout, screen_dimensions))
+
+    # Layout LargeTopCW
+    inner_layout = TwoTileLayout(selected_list[0], selected_list[2], False)
+    layout = TwoTileLayout(selected_list[1], inner_layout, True)
+    layouts.append(create_layout_entry("LargeTopCW", layout, screen_dimensions))
+
+    # Layout LargeTopCCW
+    inner_layout = TwoTileLayout(selected_list[1], selected_list[2], False)
+    layout = TwoTileLayout(selected_list[0], inner_layout, True)
+    layouts.append(create_layout_entry("LargeTopCCW", layout, screen_dimensions))
+
+    # layout with smallest crop_factor:
+    optimal_entry = min(layouts, key=lambda entry: entry["crop_factor"])
+    optimal_layout = optimal_entry["layout"]
+    optimal_name = optimal_entry["name"]
+    optimal_factor = optimal_entry["crop_factor"]
+    debug_print(f"Optimal: Layout {optimal_name} with {optimal_factor:.4f}")
+
+    # create wallpaper collage:
+    collage = optimal_layout.create_collage(screen_dimensions)
+    if output_multiple:
+        output_file = f"wallpaper-collage-{current_nr:04d}.jpg"
+    else:
+        output_file = "wallpaper-collage.jpg"
+    collage.convert("RGB").save(Path() / collage_dir / output_file, quality=jpeg_quality)
+
+    # add the actually used images to the "already chosen" list:
+    for filename in optimal_layout.filenames():
+        chosen_image_files.append(filename)
+
+    debug_print(f"Selected {len(chosen_image_files)}/{len(image_files)} images.")
+    debug_print("")
+    current_nr += 1
+
+
+def sig_change_wallpaper(signum, frame):
+    change_wallpaper()
+
+
+pr_set_name("wallpaper")
+signal.signal(signal.SIGUSR1, sig_change_wallpaper)
+signal.signal(signal.SIGUSR2, sig_collect_images)
+debug_print(f"Width: {screen_width}px")
+debug_print(f"Height: {screen_height}px")
+if output_multiple:
+    mode = "multiple"
+else:
+    mode = "single"
+debug_print(f"Output mode: {mode}")
+debug_print(f"Interval: {interval}s")
+debug_print(f"Reading from: {wallpaper_dir}")
+debug_print(f"Saving to: {collage_dir}")
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+image_files = []
+collect_images()
+chosen_image_files = []
+current_nr = 1
+first_run = True
+while True:
+    if len(chosen_image_files) > len(image_files) - 3:
+        # reset:
+        chosen_image_files = []
+        debug_print("Resetting list of already chosen images.")
+
+    if first_run or auto_change:
+        change_wallpaper()
+    first_run = False
+    sleep(interval)
